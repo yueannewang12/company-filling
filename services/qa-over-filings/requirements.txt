@@ -1,0 +1,13 @@
+Flask==3.0.3
+gunicorn==22.0.0
+
+# Spanner
+google-cloud-spanner==3.54.0
+
+# Gemini / Vertex backend (generation + embeddings)
+google-genai==1.56.0
+
+# LangChain (new 1.x stack)
+langchain>=1.2.0
+langchain-core>=1.2.0
+langchain-google-genai>=0.1.6

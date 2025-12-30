@@ -1,0 +1,8 @@
+Flask==3.0.3
+gunicorn==22.0.0
+
+# Spanner
+google-cloud-spanner==3.49.1
+
+# Gemini embeddings (Vertex backend)
+google-genai==1.56.0
