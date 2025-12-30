@@ -1,3 +1,10 @@
 
 # Ignore local virtual environments
 venv/
+
+# Python virtualenvs
+venv/
+**/venv/
+.venv/
+**/.venv/
+
