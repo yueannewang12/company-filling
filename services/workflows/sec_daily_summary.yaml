@@ -1,0 +1,43 @@
+main:
+  params: [args]
+
+  steps:
+    # -------------------------------------------------
+    # Init / defaults
+    # -------------------------------------------------
+    - init:
+        assign:
+          - qa_url: ${args.qa_url}
+          - cron_secret: ${args.cron_secret}
+          - lookback_days: ${default(map.get(args, "lookback_days"), 14)}
+
+    # -------------------------------------------------
+    # Call Cloud Run: /daily_email
+    # Uses OIDC to authenticate to private service
+    # -------------------------------------------------
+    - call_daily_email:
+        call: http.post
+        args:
+          url: ${qa_url + "/daily_email"}
+
+          # 🔐 REQUIRED for private Cloud Run
+          auth:
+            type: OIDC
+            audience: ${qa_url}
+
+          headers:
+            Content-Type: "application/json"
+            X-Cron-Secret: ${cron_secret}
+
+          body:
+            lookback_days: ${lookback_days}
+
+        result: resp
+
+    # -------------------------------------------------
+    # Return response
+    # -------------------------------------------------
+    - done:
+        return:
+          status_code: ${resp.code}
+          body: ${resp.body}

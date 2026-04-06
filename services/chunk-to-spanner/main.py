@@ -29,30 +29,62 @@ SPANNER_DATABASE = os.environ["SPANNER_DATABASE"]
 
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
 
-# Testing filter (empty => process all active companies)
 TEST_TICKER = os.environ.get("TEST_TICKER", "").strip().upper()
 
-# Chunking knobs (characters)
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "8000"))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", "400"))
 
-# How far back in GCS to scan by date folder (YYYY-MM-DD)
 LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "7"))
-
-# Caps
 MAX_FILINGS_PER_COMPANY = int(os.environ.get("MAX_FILINGS_PER_COMPANY", "10"))
 
-# Idempotency controls
 FORCE_REPROCESS = os.environ.get("FORCE_REPROCESS", "false").lower() == "true"
 RETRY_ERRORS = os.environ.get("RETRY_ERRORS", "false").lower() == "true"
 
-# Statuses we consider "done"
 DONE_STATUSES = {"CHUNKED", "EMBEDDED"}
 
 app = Flask(__name__)
 
 _storage_client = None
 _spanner_db = None
+
+# ----------------------------
+# Impact classification
+# ----------------------------
+TIER_1_FORMS = {"8-K", "10-Q", "10-K", "6-K", "20-F"}
+TIER_2_PREFIXES = ("S-1", "S-3", "F-1", "F-3", "424B", "DEF 14A", "SC 13D", "SC 13G")
+
+
+def impact_tier(form: str) -> int:
+    f = (form or "").strip().upper()
+    if f in TIER_1_FORMS:
+        return 1
+    if any(f.startswith(p) for p in TIER_2_PREFIXES):
+        return 2
+    return 3
+
+
+ITEM_PATTERNS = [
+    ("earnings", re.compile(r"\bITEM\s+2\.02\b", re.IGNORECASE)),
+    ("bankruptcy", re.compile(r"\bITEM\s+1\.03\b|\bBANKRUPTCY\b", re.IGNORECASE)),
+    ("financing", re.compile(r"\bITEM\s+2\.03\b|\bCREDIT (AGREEMENT|FACILITY)\b|\bDEBT\b", re.IGNORECASE)),
+    ("material_agreement", re.compile(r"\bITEM\s+1\.01\b|\bMATERIAL DEFINITIVE AGREEMENT\b", re.IGNORECASE)),
+    ("exec_change", re.compile(r"\bITEM\s+5\.02\b|\bCHIEF (EXECUTIVE|FINANCIAL) OFFICER\b", re.IGNORECASE)),
+    ("mna", re.compile(r"\bACQUISITION\b|\bMERGER\b", re.IGNORECASE)),
+]
+
+
+def impact_signals_for_text(form: str, raw_text: str) -> List[str]:
+    f = (form or "").strip().upper()
+    if f != "8-K":
+        return []
+    s = raw_text or ""
+    out = []
+    seen = set()
+    for name, pat in ITEM_PATTERNS:
+        if pat.search(s) and name not in seen:
+            out.append(name)
+            seen.add(name)
+    return out
 
 
 # ----------------------------
@@ -87,10 +119,6 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def parse_gcs_filing_path(blob_name: str) -> Optional[Tuple[str, str, str]]:
-    """
-    Expected: {TICKER}/{YYYY-MM-DD}/{ACCESSION}/{ACCESSION}.txt
-    Returns: (ticker, run_date, accession)
-    """
     parts = blob_name.split("/")
     if len(parts) != 4:
         return None
@@ -141,13 +169,19 @@ def gcs_read_bytes(blob_name: str, rid: str) -> bytes:
     return data
 
 
-def get_company_list(rid: str) -> List[Tuple[str, str]]:
+def get_company_list(rid: str, req_ticker: str = "") -> List[Tuple[str, str]]:
     sql = "SELECT Ticker, CIK FROM Company WHERE IsActive = TRUE"
     rows = spanner_query(sql)
     companies = [(r[0], r[1]) for r in rows]
-    if TEST_TICKER:
-        companies = [c for c in companies if c[0].upper() == TEST_TICKER]
-        log.info("[%s] TEST mode: selecting only TEST_TICKER=%s", rid, TEST_TICKER)
+    # Optional request-scoped ticker filter (workflow/body override)
+    effective_ticker = (req_ticker or "").strip().upper() or TEST_TICKER
+    if effective_ticker:
+        companies = [c for c in companies if c[0].upper() == effective_ticker]
+        if req_ticker:
+            log.info("[%s] Request filter: selecting only ticker=%s", rid, effective_ticker)
+        else:
+            log.info("[%s] ENV TEST mode: selecting only TEST_TICKER=%s", rid, effective_ticker)
+
     return companies
 
 
@@ -164,6 +198,22 @@ def get_filing_status(ticker: str, accession: str) -> Optional[str]:
     if not rows:
         return None
     return rows[0][0]
+
+
+def get_filing_impact_tier(ticker: str, accession: str) -> Optional[int]:
+    sql = """
+      SELECT ImpactTier
+      FROM Filing
+      WHERE Ticker=@t AND AccessionNo=@a
+      LIMIT 1
+    """
+    params = {"t": ticker, "a": accession}
+    ptypes = {"t": spanner.param_types.STRING, "a": spanner.param_types.STRING}
+    rows = spanner_query(sql, params=params, param_types=ptypes)
+    if not rows:
+        return None
+    v = rows[0][0]
+    return int(v) if v is not None else None
 
 
 # ----------------------------
@@ -242,15 +292,11 @@ def upsert_filing_and_chunks(
     period_end: Optional[date],
     raw_doc_gcs_path: str,
     chunks: List[Tuple[int, int, str]],
+    impact_tier_val: int,
+    impact_signals: List[str],
     rid: str,
     dry_run: bool,
 ):
-    """
-    Idempotent:
-    - delete existing chunks for (ticker, accession)
-    - upsert Filing (Status=CHUNKED)
-    - insert chunks
-    """
     if dry_run:
         log.info("[%s] DRY RUN: would write Filing + %d chunks for %s %s",
                  rid, len(chunks), ticker, accession)
@@ -278,6 +324,8 @@ def upsert_filing_and_chunks(
                 "PeriodEnd",
                 "RawDocGcsPath",
                 "Status",
+                "ImpactTier",
+                "ImpactSignals",
                 "RawJson",
                 "DetectedAt",
                 "UpdatedAt",
@@ -291,6 +339,8 @@ def upsert_filing_and_chunks(
                     period_end,
                     raw_doc_gcs_path,
                     "CHUNKED",
+                    impact_tier_val,
+                    json.dumps(impact_signals),
                     raw_json_str,
                     spanner.COMMIT_TIMESTAMP,
                     spanner.COMMIT_TIMESTAMP,
@@ -346,7 +396,7 @@ def mark_filing_error(
         raw_json = {
             "source": "chunk-to-spanner",
             "request_id": rid,
-            "error": error_msg[:4000],  # keep it bounded
+            "error": error_msg[:4000],
         }
         txn.insert_or_update(
             table="Filing",
@@ -380,10 +430,10 @@ def mark_filing_error(
 # ----------------------------
 # Main job
 # ----------------------------
-def run_job(dry_run: bool, rid: str) -> Dict:
+def run_job(dry_run: bool, rid: str, req_ticker: str = "") -> Dict:
     t0 = time.time()
 
-    companies = get_company_list(rid)
+    companies = get_company_list(rid, req_ticker=req_ticker)
     log.info("[%s] Will process %d companies", rid, len(companies))
 
     processed_filings = 0
@@ -407,7 +457,6 @@ def run_job(dry_run: bool, rid: str) -> Dict:
                     break
                 count_considered += 1
 
-                # ✅ idempotency gate
                 status = get_filing_status(ticker, accession)
                 if not FORCE_REPROCESS:
                     if status in DONE_STATUSES:
@@ -417,21 +466,27 @@ def run_job(dry_run: bool, rid: str) -> Dict:
                         skipped_error += 1
                         continue
 
-                # ✅ per-accession try/except so one bad filing doesn't block the rest
                 try:
                     raw_bytes = gcs_read_bytes(blob.name, rid)
                     raw_text = raw_bytes.decode("utf-8", errors="ignore")
 
                     meta = parse_submission_metadata(raw_text)
-                    form_type = meta.get("FormType")
+                    form_type = meta.get("FormType") or "UNKNOWN"
                     filed_at = meta.get("FiledAt")
                     period_end = meta.get("PeriodEnd")
+
+                    # tier: preserve if already exists, otherwise compute
+                    existing_tier = get_filing_impact_tier(ticker, accession)
+                    tier = existing_tier if existing_tier is not None else impact_tier(form_type)
+
+                    # signals: compute here while we already have raw_text
+                    signals = impact_signals_for_text(form_type, raw_text)
 
                     cleaned = extract_primary_text_from_submission(raw_text)
                     chunks = chunk_text(cleaned, CHUNK_SIZE, CHUNK_OVERLAP)
 
-                    log.info("[%s] %s %s: extracted %d chars, %d chunks",
-                             rid, ticker, accession, len(cleaned), len(chunks))
+                    log.info("[%s] %s %s: extracted %d chars, %d chunks (tier=%s signals=%s)",
+                             rid, ticker, accession, len(cleaned), len(chunks), tier, signals)
 
                     upsert_filing_and_chunks(
                         ticker=ticker,
@@ -442,6 +497,8 @@ def run_job(dry_run: bool, rid: str) -> Dict:
                         period_end=period_end,
                         raw_doc_gcs_path=blob.name,
                         chunks=chunks,
+                        impact_tier_val=int(tier),
+                        impact_signals=signals,
                         rid=rid,
                         dry_run=dry_run,
                     )
@@ -486,18 +543,29 @@ def run_job(dry_run: bool, rid: str) -> Dict:
 @app.route("/run", methods=["POST"])
 def run():
     rid = uuid.uuid4().hex[:8]
-    dry_run = request.args.get("dry_run", "false").lower() == "true"
+
+    body = request.get_json(silent=True) or {}
+
+    # Allow dry_run via query param (?dry_run=true) OR JSON body {"dry_run": true}
+    if "dry_run" in request.args:
+        dry_run = request.args.get("dry_run", "false").lower() == "true"
+    else:
+        dry_run = bool(body.get("dry_run", False))
+
+    # Allow request-scoped ticker filter via JSON body {"test_ticker": "AMD"}
+    req_ticker = (body.get("test_ticker") or body.get("ticker") or "").strip().upper()
 
     if CRON_SECRET:
         hdr = request.headers.get("X-Cron-Secret", "")
         if hdr != CRON_SECRET:
             return jsonify({"error": "forbidden"}), 403
 
-    log.info("[%s] /run received (dry_run=%s)", rid, dry_run)
-    return jsonify(run_job(dry_run=dry_run, rid=rid)), 200
+    log.info("[%s] /run received (dry_run=%s, req_ticker=%s)", rid, dry_run, req_ticker or "")
+    return jsonify(run_job(dry_run=dry_run, rid=rid, req_ticker=req_ticker)), 200
 
 
 @app.route("/", methods=["GET"])
+
 def root():
     return "ok", 200
 

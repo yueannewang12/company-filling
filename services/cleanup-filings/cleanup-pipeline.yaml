@@ -1,0 +1,36 @@
+main:
+  params: [args]
+  steps:
+    - init:
+        assign:
+          - cron_secret: ${args.cron_secret}
+          - cleanup_url: ${args.cleanup_url}
+          - retention_days: ${default(map.get(args, "retention_days"), 180)}
+          - dry_run: ${default(map.get(args, "dry_run"), false)}
+          - test_ticker: ${default(map.get(args, "test_ticker"), "")}
+
+          - headers:
+              Content-Type: application/json
+              X-Cron-Secret: ${cron_secret}
+
+    - cleanup:
+        call: http.post
+        args:
+          url: ${cleanup_url + "/run?dry_run=" + string(dry_run)}
+          headers: ${headers}
+          auth:
+            type: OIDC
+            audience: ${cleanup_url}
+          body:
+            retention_days: ${retention_days}
+            test_ticker: ${test_ticker}
+          timeout: 900
+        result: cleanup_resp
+
+    - cleanup_check:
+        switch:
+          - condition: ${cleanup_resp.code != 200}
+            raise: ${"cleanup-filings failed"}
+
+    - done:
+        return: ${cleanup_resp.body}

@@ -1,0 +1,108 @@
+main:
+  params: [args]
+  steps:
+    - init:
+        assign:
+          - cron_secret: ${args.cron_secret}
+          - ingest_url: ${args.ingest_url}
+          - chunk_url: ${args.chunk_url}
+          - embed_url: ${args.embed_url}
+          - qa_url: ${args.qa_url}
+
+          - test_ticker: ${default(map.get(args, "test_ticker"), "")}
+          - dry_run: ${default(map.get(args, "dry_run"), false)}
+
+          - headers:
+              Content-Type: application/json
+              X-Cron-Secret: ${cron_secret}
+
+    # ----------------------------
+    # 1) ingest-sec
+    # ----------------------------
+    - ingest:
+        call: http.post
+        args:
+          url: ${ingest_url + "/run"}
+          headers: ${headers}
+          auth:
+            type: OIDC
+            audience: ${ingest_url}
+          body:
+            test_ticker: ${test_ticker}
+            dry_run: ${dry_run}
+          timeout: 900
+        result: ingest_resp
+
+    - ingest_check:
+        switch:
+          - condition: ${ingest_resp.code != 200}
+            raise: ${"ingest-sec failed"}
+
+    # ----------------------------
+    # 2) chunk-to-spanner
+    # ----------------------------
+    - chunk:
+        call: http.post
+        args:
+          url: ${chunk_url + "/run"}
+          headers: ${headers}
+          auth:
+            type: OIDC
+            audience: ${chunk_url}
+          body:
+            test_ticker: ${test_ticker}
+            dry_run: ${dry_run}
+          timeout: 900
+        result: chunk_resp
+
+    - chunk_check:
+        switch:
+          - condition: ${chunk_resp.code != 200}
+            raise: ${"chunk-to-spanner failed"}
+
+    # ----------------------------
+    # 3) embed-chunks
+    # ----------------------------
+    - embed:
+        call: http.post
+        args:
+          url: ${embed_url + "/run"}
+          headers: ${headers}
+          auth:
+            type: OIDC
+            audience: ${embed_url}
+          body:
+            test_ticker: ${test_ticker}
+            dry_run: ${dry_run}
+          timeout: 900
+        result: embed_resp
+
+    - embed_check:
+        switch:
+          - condition: ${embed_resp.code != 200}
+            raise: ${"embed-chunks failed"}
+
+    # ----------------------------
+    # 4) QA (health check for now)
+    # ----------------------------
+    - qa:
+        call: http.get
+        args:
+          url: ${qa_url + "/"}
+          auth:
+            type: OIDC
+            audience: ${qa_url}
+          timeout: 60
+        result: qa_resp
+
+    - qa_check:
+        switch:
+          - condition: ${qa_resp.code != 200}
+            raise: ${"qa-over-filings failed"}
+
+    - done:
+        return:
+          ingest: ${ingest_resp.body}
+          chunk: ${chunk_resp.body}
+          embed: ${embed_resp.body}
+          qa: ${qa_resp.body}

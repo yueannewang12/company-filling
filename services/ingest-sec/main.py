@@ -3,7 +3,7 @@ import json
 import time
 import logging
 import uuid
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -35,6 +35,21 @@ app = Flask(__name__)
 
 _storage_client = None
 _spanner_db = None
+
+# ----------------------------
+# Impact classification (tier only at ingest)
+# ----------------------------
+TIER_1_FORMS = {"8-K", "10-Q", "10-K", "6-K", "20-F"}
+TIER_2_PREFIXES = ("S-1", "S-3", "F-1", "F-3", "424B", "DEF 14A", "SC 13D", "SC 13G")
+
+
+def impact_tier(form: str) -> int:
+    f = (form or "").strip().upper()
+    if f in TIER_1_FORMS:
+        return 1
+    if any(f.startswith(p) for p in TIER_2_PREFIXES):
+        return 2
+    return 3
 
 
 # ----------------------------
@@ -73,7 +88,6 @@ def http_get(url: str, rid: str) -> requests.Response:
     headers = {
         "User-Agent": SEC_USER_AGENT,
         "Accept-Encoding": "gzip, deflate",
-        # SEC endpoints differ; keep Host consistent with URL to avoid edge issues.
         "Host": "data.sec.gov" if "data.sec.gov" in url else "www.sec.gov",
     }
     log.info("[%s] HTTP GET %s (timeout=%s)", rid, url, HTTP_TIMEOUT)
@@ -109,8 +123,21 @@ def accession_to_txt_path(ticker: str, run_date: str, accession: str) -> str:
 
 def build_filing_txt_url(cik: str, accession: str) -> str:
     accession_nodash = accession.replace("-", "")
-    cik_int = str(int(cik))  # SEC archive path uses CIK without leading zeros
+    cik_int = str(int(cik))
     return f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{accession_nodash}/{accession}.txt"
+
+
+def filingdate_to_filedat_ts(filing_date_iso: str) -> Optional[datetime]:
+    # SEC filingDate is YYYY-MM-DD
+    try:
+        d = date.fromisoformat(filing_date_iso)
+        return datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def normalize_company_name(name: str) -> str:
+    return (name or "").strip()
 
 
 # ----------------------------
@@ -120,9 +147,7 @@ def fetch_company_list(rid: str) -> List[Tuple[str, str]]:
     sql = "SELECT Ticker, CIK FROM Company WHERE IsActive = TRUE"
     log.info("[%s] SPANNER query start: %s", rid, sql)
     t0 = time.time()
-
     rows = spanner_query(sql)
-
     log.info("[%s] SPANNER query done: %d rows in %.2fs", rid, len(rows), time.time() - t0)
 
     companies = [(r[0], r[1]) for r in rows]
@@ -157,6 +182,110 @@ def upsert_ingest_state(ticker: str, cik: str, last_filing_date: date, last_acce
         )
 
 
+def upsert_company_name_from_submissions(
+    ticker: str,
+    cik: str,
+    sec_name: str,
+    rid: str,
+) -> None:
+    """
+    Keeps Company.Name populated without breaking NOT NULL CreatedAt/UpdatedAt.
+
+    Logic:
+      - If Company row exists: update Name (only if SEC name is non-empty) + UpdatedAt
+      - If Company row missing: insert row with CreatedAt/UpdatedAt, IsActive=TRUE, Name if present
+    """
+    name = normalize_company_name(sec_name)
+    db = spanner_db()
+
+    def txn_fn(txn):
+        # Read current row (if any)
+        sql = "SELECT Name FROM Company WHERE Ticker=@t"
+        params = {"t": ticker}
+        ptypes = {"t": spanner.param_types.STRING}
+        rows = list(txn.execute_sql(sql, params=params, param_types=ptypes))
+
+        if rows:
+            # Exists: update only if we have a non-empty SEC name
+            if name:
+                txn.update(
+                    table="Company",
+                    columns=("Ticker", "Name", "CIK", "UpdatedAt"),
+                    values=[(ticker, name, cik, spanner.COMMIT_TIMESTAMP)],
+                )
+                log.info("[%s] Company updated: %s Name=%s", rid, ticker, name)
+            else:
+                # still keep CIK current + UpdatedAt
+                txn.update(
+                    table="Company",
+                    columns=("Ticker", "CIK", "UpdatedAt"),
+                    values=[(ticker, cik, spanner.COMMIT_TIMESTAMP)],
+                )
+                log.info("[%s] Company updated (no name): %s CIK=%s", rid, ticker, cik)
+        else:
+            # Missing: insert
+            txn.insert(
+                table="Company",
+                columns=("Ticker", "CIK", "Name", "IsActive", "CreatedAt", "UpdatedAt"),
+                values=[(ticker, cik, name if name else None, True, spanner.COMMIT_TIMESTAMP, spanner.COMMIT_TIMESTAMP)],
+            )
+            log.info("[%s] Company inserted: %s CIK=%s Name=%s", rid, ticker, cik, name)
+
+    try:
+        db.run_in_transaction(txn_fn)
+    except Exception as e:
+        # Don't fail ingestion if name upsert fails; log and proceed
+        log.exception("[%s] Company name upsert failed for %s: %s", rid, ticker, e)
+
+
+def upsert_filing_metadata(
+    ticker: str,
+    accession: str,
+    form_type: str,
+    filed_at: Optional[datetime],
+    impact_tier_val: int,
+    raw_doc_gcs_path: str,
+    rid: str,
+) -> None:
+    """
+    Idempotent upsert. Does NOT set ImpactSignals here (left for chunker).
+    """
+    db = spanner_db()
+    raw_json = {"source": "ingest-sec", "request_id": rid}
+    with db.batch() as batch:
+        batch.insert_or_update(
+            table="Filing",
+            columns=(
+                "Ticker",
+                "AccessionNo",
+                "FormType",
+                "FiledAt",
+                "RawDocGcsPath",
+                "Status",
+                "ImpactTier",
+                "ImpactSignals",
+                "RawJson",
+                "DetectedAt",
+                "UpdatedAt",
+            ),
+            values=[
+                (
+                    ticker,
+                    accession,
+                    (form_type or "UNKNOWN")[:12],
+                    filed_at,
+                    raw_doc_gcs_path,
+                    "NEW",
+                    impact_tier_val,
+                    json.dumps([]),
+                    json.dumps(raw_json),
+                    spanner.COMMIT_TIMESTAMP,
+                    spanner.COMMIT_TIMESTAMP,
+                )
+            ],
+        )
+
+
 # ----------------------------
 # SEC parsing
 # ----------------------------
@@ -166,9 +295,6 @@ def fetch_submissions_json(cik: str, rid: str) -> Dict:
 
 
 def parse_recent_filings(submissions: Dict) -> List[Dict]:
-    """
-    Returns filings in the SEC 'recent' order (most recent first).
-    """
     recent = submissions.get("filings", {}).get("recent", {})
     forms = recent.get("form", [])
     filing_dates = recent.get("filingDate", [])
@@ -192,16 +318,12 @@ def parse_recent_filings(submissions: Dict) -> List[Dict]:
 def is_newer_than_state(
     filing_date: date, accession: str, last_date: Optional[date], last_acc: Optional[str]
 ) -> bool:
-    """
-    Treat (filing_date, accession) as an ordering key.
-    """
     if last_date is None:
         return True
     if filing_date > last_date:
         return True
     if filing_date < last_date:
         return False
-    # same date
     if last_acc is None:
         return True
     return accession > last_acc
@@ -214,10 +336,6 @@ def pick_new_filings_to_process(
     cap: int,
     scan_limit: int = 50,
 ) -> List[Dict]:
-    """
-    Look at up to scan_limit recent items, keep those newer than state,
-    return up to cap in the original order (most recent first).
-    """
     new_filings: List[Dict] = []
     for f in all_recent[:scan_limit]:
         try:
@@ -237,140 +355,185 @@ def pick_new_filings_to_process(
 # ----------------------------
 # Job
 # ----------------------------
-def ingest_job(dry_run: bool, rid: str) -> Dict:
+def ingest_job(dry_run: bool, rid: str, override_test_ticker: str = "", override_cap: int = 0) -> Dict:
     t0 = time.time()
     run_date = datetime.utcnow().strftime("%Y-%m-%d")
 
-    companies = fetch_company_list(rid)
-    log.info("[%s] Will process %d companies", rid, len(companies))
+    # request-level overrides (optional)
+    global TEST_TICKER, RECENT_FILINGS_PER_COMPANY
+    req_test = (override_test_ticker or "").strip().upper()
+    req_cap = int(override_cap) if override_cap else 0
 
-    processed = 0
-    errors = []
+    orig_test = TEST_TICKER
+    orig_cap = RECENT_FILINGS_PER_COMPANY
+    if req_test:
+        TEST_TICKER = req_test
+    if req_cap > 0:
+        RECENT_FILINGS_PER_COMPANY = req_cap
 
-    for ticker, cik in companies:
-        t_company = time.time()
-        log.info("[%s] ---- Company start: %s (CIK=%s) ----", rid, ticker, cik)
+    try:
+        companies = fetch_company_list(rid)
+        log.info("[%s] Will process %d companies", rid, len(companies))
 
-        try:
-            last_date, last_acc = get_ingest_state(ticker)
-            log.info(
-                "[%s] State for %s: LastFilingDate=%s LastAccession=%s",
-                rid,
-                ticker,
-                last_date,
-                last_acc,
-            )
+        processed = 0
+        errors = []
 
-            # Must fetch SEC submissions to know if there are new filings
-            submissions = fetch_submissions_json(cik, rid)
+        for ticker, cik in companies:
+            t_company = time.time()
+            log.info("[%s] ---- Company start: %s (CIK=%s) ----", rid, ticker, cik)
 
-            candidates = parse_recent_filings(submissions)
-            new_filings = pick_new_filings_to_process(
-                all_recent=candidates,
-                last_date=last_date,
-                last_acc=last_acc,
-                cap=RECENT_FILINGS_PER_COMPANY,
-                scan_limit=max(RECENT_FILINGS_PER_COMPANY, 10),
-            )
-
-            log.info(
-                "[%s] %s: %d new filings to download (cap=%d)",
-                rid,
-                ticker,
-                len(new_filings),
-                RECENT_FILINGS_PER_COMPANY,
-            )
-
-            # NEW LAYER: only write submissions JSON if there are new filings
-            if new_filings:
-                sub_path = f"{ticker}/{run_date}/sec_submissions_{cik10(cik)}.json"
-                if dry_run:
-                    log.info(
-                        "[%s] DRY RUN: would write submissions JSON -> gs://%s/%s",
-                        rid,
-                        GCS_BUCKET,
-                        sub_path,
-                    )
-                else:
-                    if not gcs_exists(sub_path):
-                        gcs_write_bytes(sub_path, json.dumps(submissions).encode("utf-8"), rid)
-                    else:
-                        log.info("[%s] Submissions JSON already exists, skip: gs://%s/%s", rid, GCS_BUCKET, sub_path)
-
-            if not new_filings:
-                processed += 1
+            try:
+                last_date, last_acc = get_ingest_state(ticker)
                 log.info(
-                    "[%s] ---- Company done: %s (no new filings) in %.2fs ----",
+                    "[%s] State for %s: LastFilingDate=%s LastAccession=%s",
                     rid,
                     ticker,
-                    time.time() - t_company,
+                    last_date,
+                    last_acc,
                 )
-                continue
 
-            newest_seen_date = last_date
-            newest_seen_acc = last_acc
+                submissions = fetch_submissions_json(cik, rid)
 
-            for f in new_filings:
-                fd = date.fromisoformat(f["filingDate"])
-                acc = f["accessionNumber"]
+                # ✅ NEW: populate Company.Name (best-effort; doesn't fail job)
+                sec_name = submissions.get("name", "")  # SEC submissions typically includes company name
+                if not dry_run:
+                    upsert_company_name_from_submissions(
+                        ticker=ticker,
+                        cik=cik10(cik),
+                        sec_name=sec_name,
+                        rid=rid,
+                    )
 
-                txt_path = accession_to_txt_path(ticker, run_date, acc)
+                candidates = parse_recent_filings(submissions)
+                new_filings = pick_new_filings_to_process(
+                    all_recent=candidates,
+                    last_date=last_date,
+                    last_acc=last_acc,
+                    cap=RECENT_FILINGS_PER_COMPANY,
+                    scan_limit=max(RECENT_FILINGS_PER_COMPANY, 10),
+                )
 
-                if dry_run:
+                log.info(
+                    "[%s] %s: %d new filings to download (cap=%d)",
+                    rid,
+                    ticker,
+                    len(new_filings),
+                    RECENT_FILINGS_PER_COMPANY,
+                )
+
+                # Only write submissions JSON if there are new filings
+                if new_filings:
+                    sub_path = f"{ticker}/{run_date}/sec_submissions_{cik10(cik)}.json"
+                    if dry_run:
+                        log.info(
+                            "[%s] DRY RUN: would write submissions JSON -> gs://%s/%s",
+                            rid,
+                            GCS_BUCKET,
+                            sub_path,
+                        )
+                    else:
+                        if not gcs_exists(sub_path):
+                            gcs_write_bytes(sub_path, json.dumps(submissions).encode("utf-8"), rid)
+                        else:
+                            log.info(
+                                "[%s] Submissions JSON already exists, skip: gs://%s/%s",
+                                rid,
+                                GCS_BUCKET,
+                                sub_path,
+                            )
+
+                if not new_filings:
+                    processed += 1
                     log.info(
-                        "[%s] DRY RUN: would download %s %s %s -> gs://%s/%s",
+                        "[%s] ---- Company done: %s (no new filings) in %.2fs ----",
                         rid,
                         ticker,
-                        f.get("form", ""),
-                        acc,
-                        GCS_BUCKET,
-                        txt_path,
+                        time.time() - t_company,
                     )
-                else:
-                    if gcs_exists(txt_path):
-                        log.info("[%s] GCS exists, skip: gs://%s/%s", rid, GCS_BUCKET, txt_path)
+                    continue
+
+                newest_seen_date = last_date
+                newest_seen_acc = last_acc
+
+                for f in new_filings:
+                    fd = date.fromisoformat(f["filingDate"])
+                    acc = f["accessionNumber"]
+                    form_type = (f.get("form") or "UNKNOWN").strip().upper()
+
+                    txt_path = accession_to_txt_path(ticker, run_date, acc)
+
+                    if dry_run:
+                        log.info(
+                            "[%s] DRY RUN: would download %s %s %s -> gs://%s/%s",
+                            rid,
+                            ticker,
+                            form_type,
+                            acc,
+                            GCS_BUCKET,
+                            txt_path,
+                        )
                     else:
-                        url = build_filing_txt_url(cik, acc)
-                        content = http_get(url, rid).content
-                        gcs_write_bytes(txt_path, content, rid)
+                        if gcs_exists(txt_path):
+                            log.info("[%s] GCS exists, skip download: gs://%s/%s", rid, GCS_BUCKET, txt_path)
+                        else:
+                            url = build_filing_txt_url(cik, acc)
+                            content = http_get(url, rid).content
+                            gcs_write_bytes(txt_path, content, rid)
 
-                # Track max (fd, acc)
-                if newest_seen_date is None:
-                    newest_seen_date, newest_seen_acc = fd, acc
-                else:
-                    if fd > newest_seen_date:
+                        # ✅ idempotent metadata upsert to Filing
+                        tier = impact_tier(form_type)
+                        filed_at = filingdate_to_filedat_ts(f.get("filingDate", ""))
+                        upsert_filing_metadata(
+                            ticker=ticker,
+                            accession=acc,
+                            form_type=form_type,
+                            filed_at=filed_at,
+                            impact_tier_val=tier,
+                            raw_doc_gcs_path=txt_path,
+                            rid=rid,
+                        )
+
+                    # Track max (fd, acc)
+                    if newest_seen_date is None:
                         newest_seen_date, newest_seen_acc = fd, acc
-                    elif fd == newest_seen_date and (newest_seen_acc is None or acc > newest_seen_acc):
-                        newest_seen_date, newest_seen_acc = fd, acc
+                    else:
+                        if fd > newest_seen_date:
+                            newest_seen_date, newest_seen_acc = fd, acc
+                        elif fd == newest_seen_date and (newest_seen_acc is None or acc > newest_seen_acc):
+                            newest_seen_date, newest_seen_acc = fd, acc
 
-            if not dry_run and newest_seen_date and newest_seen_acc:
-                upsert_ingest_state(ticker, cik10(cik), newest_seen_date, newest_seen_acc)
-                log.info(
-                    "[%s] Updated state for %s => %s / %s",
-                    rid,
-                    ticker,
-                    newest_seen_date,
-                    newest_seen_acc,
-                )
+                if not dry_run and newest_seen_date and newest_seen_acc:
+                    upsert_ingest_state(ticker, cik10(cik), newest_seen_date, newest_seen_acc)
+                    log.info(
+                        "[%s] Updated state for %s => %s / %s",
+                        rid,
+                        ticker,
+                        newest_seen_date,
+                        newest_seen_acc,
+                    )
 
-            processed += 1
-            log.info("[%s] ---- Company done: %s in %.2fs ----", rid, ticker, time.time() - t_company)
+                processed += 1
+                log.info("[%s] ---- Company done: %s in %.2fs ----", rid, ticker, time.time() - t_company)
 
-        except Exception as e:
-            log.exception("[%s] Company failed: %s (CIK=%s)", rid, ticker, cik)
-            errors.append({"ticker": ticker, "cik": cik, "error": str(e)})
+            except Exception as e:
+                log.exception("[%s] Company failed: %s (CIK=%s)", rid, ticker, cik)
+                errors.append({"ticker": ticker, "cik": cik, "error": str(e)})
 
-    result = {
-        "request_id": rid,
-        "utc": datetime.utcnow().isoformat() + "+00:00",
-        "dry_run": dry_run,
-        "company_count_targeted": len(companies),
-        "processed_companies": processed,
-        "errors": errors,
-        "seconds": round(time.time() - t0, 3),
-    }
-    log.info("[%s] JOB DONE: %s", rid, result)
-    return result
+        result = {
+            "request_id": rid,
+            "utc": datetime.utcnow().isoformat() + "+00:00",
+            "dry_run": dry_run,
+            "company_count_targeted": len(companies),
+            "processed_companies": processed,
+            "errors": errors,
+            "seconds": round(time.time() - t0, 3),
+        }
+        log.info("[%s] JOB DONE: %s", rid, result)
+        return result
+    finally:
+        # restore globals after request override
+        TEST_TICKER = orig_test
+        RECENT_FILINGS_PER_COMPANY = orig_cap
 
 
 # ----------------------------
@@ -386,8 +549,19 @@ def run():
         if hdr != CRON_SECRET:
             return jsonify({"error": "forbidden"}), 403
 
+    body = request.get_json(silent=True) or {}
+    override_test_ticker = (body.get("test_ticker") or "").strip()
+    override_cap = int(body.get("recent_filings_per_company") or 0)
+
     log.info("[%s] /run received (dry_run=%s)", rid, dry_run)
-    return jsonify(ingest_job(dry_run=dry_run, rid=rid)), 200
+    return jsonify(
+        ingest_job(
+            dry_run=dry_run,
+            rid=rid,
+            override_test_ticker=override_test_ticker,
+            override_cap=override_cap,
+        )
+    ), 200
 
 
 @app.route("/", methods=["GET"])
