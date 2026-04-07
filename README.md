@@ -16,6 +16,35 @@ This application automates the process of monitoring public companies for new SE
 *   **"No News" Notifications**: Sends a heartbeat email even when no new filings are found, so you know the system is working.
 *   **Fully Serverless Orchestration**: Managed via **Google Cloud Workflows** and scheduled with **Cloud Scheduler**.
 
+## 📐 Architecture
+
+### Visual Overview
+
+![Architecture Diagram](assets/architecture.png)
+
+### Component Diagram (Mermaid)
+
+```mermaid
+graph TD
+    SEC[SEC EDGAR] --> Ingest[Ingest Service Cloud Run]
+    
+    subgraph GCP
+        Scheduler[Cloud Scheduler] --> Workflows[Cloud Workflows]
+        Workflows --> Ingest
+        
+        Ingest --> GCS[Cloud Storage Raw Documents]
+        Ingest --> Spanner[(Cloud Spanner Relational + Vectors)]
+        
+        QAService[QA & Summary Service Cloud Run] --> Spanner
+        QAService --> VertexAI[Vertex AI Gemini]
+        
+        Workflows --> QAService
+    end
+    
+    QAService --> UI[Q&A Interface]
+    QAService --> Email[Email Notifications]
+```
+
 ## 🛠️ Tech Stack
 
 *   **Database**: Google Cloud Spanner (relational storage + vector search).
